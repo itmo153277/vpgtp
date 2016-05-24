@@ -3,7 +3,7 @@
 
 import socket
 
-# Запускает функцию в новом потоке
+# Р—Р°РїСѓСЃРєР°РµС‚ С„СѓРЅРєС†РёСЋ РІ РЅРѕРІРѕРј РїРѕС‚РѕРєРµ
 def threadStart(func):
   from threading import Thread
   class NewThread(Thread):
@@ -15,7 +15,7 @@ def threadStart(func):
   nt.start()
   return nt
 
-# Отправляет данные из сети программе
+# РћС‚РїСЂР°РІР»СЏРµС‚ РґР°РЅРЅС‹Рµ РёР· СЃРµС‚Рё РїСЂРѕРіСЂР°РјРјРµ
 def sockToApp(sock, proc):
   import sys
   try:
@@ -36,7 +36,7 @@ def sockToApp(sock, proc):
     except:
       proc.kill()
 
-# Отправляет данные программы в сеть
+# РћС‚РїСЂР°РІР»СЏРµС‚ РґР°РЅРЅС‹Рµ РїСЂРѕРіСЂР°РјРјС‹ РІ СЃРµС‚СЊ
 def appToSock(sock, proc):
   import sys
   try:
@@ -53,12 +53,12 @@ def appToSock(sock, proc):
   except:
     pass
     
-# Поделючается к серверу
+# РџРѕРґРµР»СЋС‡Р°РµС‚СЃСЏ Рє СЃРµСЂРІРµСЂСѓ
 def clientStart(host, port, cmdLine, setup):
   import shlex
   from subprocess import Popen, PIPE
   
-  proc = Popen(shlex.split(cmdLine), stdin = PIPE, stdout = PIPE, stderr=PIPE)
+  proc = Popen(shlex.split(cmdLine), stdin = PIPE, stdout = PIPE)
   for x in setup:
     proc.stdin.write(("%s\n" % x).encode('utf-8'))
     proc.stdin.flush()
