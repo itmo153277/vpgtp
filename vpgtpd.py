@@ -34,7 +34,7 @@ def threadStart(func):
   nt.start()
   return nt
 
-# Позволяет полключаться к KGS и транслировать партию
+# Позволяет подключаться к KGS и транслировать партию
 class KgsClient(object):
   # Принимает адрес API, логин и пароль
   def __init__(self, kgsApi, kgsName, kgsPassword):
@@ -110,6 +110,8 @@ class KgsClient(object):
           self.msgQueue.remove(ret)
         elif msgFilter not in self.msgQueueFilter:
           hope = False
+        else:
+          self.queueFeed.clear()
       finally:
         self.queueLock.release()
     return ret
@@ -411,7 +413,7 @@ class KgsClient(object):
     try:
       self.logMessages -= 1
       if self.logMessages == 0:
-        self.logMessages = []
+        self.msgLog = []
     finally:
       self.logLock.release()
   # Конец ожидания сообщения
