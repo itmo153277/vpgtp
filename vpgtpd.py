@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # Выполнение функции с таймаутом по времени (в секундах)
-def timeout(func, time):
+def timeout(func, time, timeoutVal = "timeout"):
   from threading import Thread
   # Внешний поток для выполнения функции
   class InterruptableThread(Thread):
@@ -18,7 +18,7 @@ def timeout(func, time):
   it.start()
   it.join(time)
   if it.isAlive():
-    return "timeout"
+    return timeoutVal
   else:
     return it.result
 
@@ -29,10 +29,433 @@ def threadStart(func):
     def __init__(self):
       Thread.__init__(self)
     def run(self):
-      func()    
+      func()
   nt = NewThread()
   nt.start()
   return nt
+
+# Позволяет полключаться к KGS и транслировать партию
+class KgsClient(object):
+  # Принимает адрес API, логин и пароль
+  def __init__(self, kgsApi, kgsName, kgsPassword):
+    from requests import Session
+    from threading import Lock, Event
+    self.session = Session()
+    self.session.keep_alive = False
+    self.api = kgsApi
+    self.login = kgsName
+    self.pwd = kgsPassword
+    self.terminated = False
+    self.rooms = {}
+    self.games = {}
+    self.channels = []
+    self.msgQueueFilter = []
+    self.msgQueue = []
+    self.queueLock = Lock()
+    self.queueFeed = Event()
+    self.proc = None
+    self.logMessages = 0
+    self.logLock = Lock()
+    self.msgLog = []
+    if not self.signIn():
+      raise ValueError
+  # Отключается от KGS
+  def terminate(self):
+    self.sendRequest({"type":"LOGOUT"})
+    self.proc.join()
+  # Обрабатывает ответ
+  def processResponse(self):
+    from requests import exceptions
+    from time import sleep
+    from json import loads
+    while not self.terminated:
+      try:
+        req = self.session.get(self.api)
+      except exceptions.Timeout:
+        continue
+      if req.status_code == 200:
+        msg = loads(req.content.decode('utf-8'))
+        if "messages" in msg:
+          for x in msg["messages"]:
+            self.processMessage(x)
+      else:
+        self.processMessage({"type": "LOGOUT"})
+  # Отправляет запрос на сервер
+  def sendRequest(self, msg):
+    from requests import exceptions
+    from json import dumps
+    if self.terminated:
+      return None
+    print("U: %s" % str(msg))
+    ret = None
+    try:
+      req = self.session.post(self.api, data = dumps(msg), timeout = 20)
+    except exceptions.Timeout:
+      return None
+    ret = req.text
+    return ret
+  # Ожидает прихода сообщения по фильтру
+  def waitForQueueMsg(self, msgFilter):
+    ret = None
+    hope = True
+    while hope and ret is None:
+      self.queueFeed.wait()
+      self.queueLock.acquire()
+      try:
+        for x in self.msgQueue:
+          if msgFilter(x):
+            ret = x
+            break
+        if ret is not None:
+          self.msgQueue.remove(ret)
+        elif msgFilter not in self.msgQueueFilter:
+          hope = False
+      finally:
+        self.queueLock.release()
+    return ret
+  # Отправляет запрос и ждет ответа
+  def sendRequestAndWaitAnswer(self, msg, msgFilter):
+    if self.terminated:
+      return None
+    self.startWaitMsg()
+    if self.sendRequest(msg) != "OK":
+      self.cancelWaitMsg()
+      return None
+    return self.endWaitMsg(msgFilter)
+  # Логинится
+  def signIn(self):
+    return self.sendRequestAndWaitAnswer({"type": "LOGIN", "name": self.login, "password": self.pwd, "locale": "en_US"}, lambda x: x["type"] == "LOGIN_SUCCESS") is not None
+  # Обрабатывает сообщение
+  def processMessage(self, msg):
+    print("D: %s" % str(msg))
+    self.logLock.acquire()
+    try:
+      if self.logMessages > 0:
+        self.msgLog.append(msg)
+    finally:
+      self.logLock.release()
+    self.queueLock.acquire()
+    try:
+      for x in self.msgQueueFilter:
+        if x(msg):
+          self.msgQueue.append(msg)
+          self.msgQueueFilter.remove(x)
+          self.queueFeed.set()
+    finally:
+      self.queueLock.release()
+    if msg["type"] == "LOGOUT":
+      self.terminated = True
+      self.queueLock.acquire()
+      try:
+        self.msgQueueFilter = []
+        self.queueFeed.set()
+      finally:
+        self.queueLock.release()
+    elif msg["type"] == "IDLE_WARNING":
+      self.sendRequest({"type": "WAKE_UP"})
+    elif msg["type"] == "ROOM_NAMES":
+      for x in msg["rooms"]:
+        self.rooms[x["channelId"]] = x["name"]
+    elif msg["type"] == "GAME_JOIN":
+      game = {"nodes":{0:{"nodeId": 0, "parentNode": -1, "position": 0, "props": []}}, "activeNode": 0}
+      for x in msg["sgfEvents"]:
+        self.parseSgfEvent(game, x)
+      self.games[msg["channelId"]] = game
+    elif msg["type"] == "GAME_UPDATE":
+      game = self.games[msg["channelId"]]
+      for x in msg["sgfEvents"]:
+        self.parseSgfEvent(game, x)
+    elif msg["type"] == "JOIN_COMPLETE":
+      self.channels.append(msg["channelId"])
+    elif msg["type"] == "UNJOIN":
+      self.channels.remove(msg["channelId"])
+  # Ищет определенное SGF свойство
+  def findProp(self, props, prop):
+    foundProp = None
+    for x in props:
+      if x["name"] == prop["name"] and ("color" not in prop or x["color"] == prop["color"]) and ("loc" not in prop or x["loc"] == prop["loc"]):
+        foundProp = x
+        break
+    return foundProp
+  # Обрабатывает SGF событие
+  def parseSgfEvent(self, game, event):
+    node = game["nodes"][event["nodeId"]]
+    if event["type"] == "CHILD_ADDED":
+      newNode = {"nodeId": event["childNodeId"], "parentNode": node["nodeId"], "position": 0, "props": []}
+      if "position" in event:
+        newNode["position"] = event["position"]
+      game["nodes"][newNode["nodeId"]] = newNode
+    elif event["type"] == "CHILDREN_REORDERED":
+      for pos in range(0, len(event["children"])):
+        game["nodes"][event["children"][pos]]["position"] = pos
+    elif event["type"] == "ACTIVATED":
+      game["activeNode"] = node["nodeId"]
+    elif event["type"] in {"PROP_ADDED", "PROP_CHANGED"}:
+      prop = event["prop"]
+      oldProp = self.findProp(node["props"], prop)
+      if oldProp:
+        node["props"].remove(oldProp)
+      node["props"].append(prop)
+    elif event["type"] == "PROP_REMOVED":
+      prop = event["prop"]
+      node["props"].remove(self.findProp(node["props"], prop))
+    elif event["type"] == "PROP_GROUP_ADDED":
+      for prop in event["props"]:
+        oldProp = self.findProp(node["props"], prop)
+        if oldProp:
+          node["props"].remove(oldProp)
+        node["props"].append(prop)
+    elif event["type"] == "PROP_GROUP_REMOVED":
+      for prop in event["props"]:
+        node["props"].remove(self.findProp(node["props"], prop))
+  # Отправляет событие в чат
+  def sendMessage(self, channelId, msg):
+    self.sendRequest({"type": "CHAT", "channelId": channelId, "text": msg})
+  # Ищет комнату
+  def channelIdByRoomName(self, roomName):
+    return list(self.rooms.keys())[list(self.rooms.values()).index(roomName)];
+  # Создает партию для демонстрации
+  def createDemo(self, channelId, boardSize, komi, timeSystem, mainTime, byoyomiTime, byoyomiStones):
+    self.startWaitMsg()
+    game = self.sendRequestAndWaitAnswer({
+      "type": "CHALLENGE_CREATE",
+      "channelId": channelId,
+      "callbackKey": 0,
+      "global": False,
+      "text": "",
+      "proposal": {
+        "gameType": "demonstration",
+        "nigiri": False,
+        "rules": {
+          "rules": "chinese",
+          "size": boardSize,
+          "komi": komi,
+          "timeSystem": timeSystem,
+          "mainTime": mainTime,
+          "byoYomiTime": byoyomiTime,
+          "byoYomiStones": byoyomiStones
+        },
+        "players": [{
+          "role": "owner",
+          "name": self.login
+        }]
+    }}, lambda x: x["type"] == "GAME_NOTIFY")
+    gameId = None
+    if game:
+      gameId = game["game"]["channelId"]
+    else:
+      self.cancelWaitMsg()
+      return None
+    self.endWaitMsg(lambda x: x["type"] == "GAME_JOIN" and x["channelId"] == gameId)
+    return gameId
+  # Обновляет информацию
+  def demoSetInfo(self, channelId, playerWhite, playerBlack, place, gameName):
+    self.sendRequest({
+      "type": "KGS_SGF_CHANGE",
+      "channelId": channelId,
+      "sgfEvents": [
+        {
+          "type": "PROP_GROUP_ADDED",
+          "nodeId": 0,
+          "props": [
+            {
+              "name": "PLAYERNAME",
+              "color": "white",
+              "text": playerWhite
+            }, {
+              "name": "PLAYERNAME",
+              "color": "black",
+              "text": playerBlack
+            }, {
+              "name": "PLACE",
+              "text": place
+            }, {
+              "name": "GAMENAME",
+              "text": gameName
+            }
+          ]
+        }
+      ]
+    })
+  # Делает ход в демонстрации
+  def demoPlayMove(self, channelId, colour, place):
+    game = self.games[channelId]
+    newNode = max(game["nodes"].keys()) + 1
+    placeSgf = None
+    if place.lower() == "pass":
+      placeSgf = "PASS"
+    else:
+      x = ord(place[:1].lower()) - ord('a')
+      y = 19 - int(place[1:])
+      if x > 8:
+        x -= 1
+      placeSgf = {"x": x, "y": y}
+    def findEvent(events, nodeId):
+      for event in events:
+        if event["type"] == "ACTIVATED" and event["nodeId"] == nodeId:
+          return True
+      return False
+    self.sendRequestAndWaitAnswer({
+      "type": "KGS_SGF_CHANGE",
+      "channelId": channelId,
+      "sgfEvents": [
+        {
+          "type": "CHILD_ADDED",
+          "nodeId": game["activeNode"],
+          "childNodeId": newNode
+        },
+        {
+          "type": "PROP_ADDED",
+          "nodeId": newNode,
+          "prop": {
+            "name": "MOVE",
+            "loc": placeSgf,
+            "color": colour
+          }
+        },
+        {
+          "type": "ACTIVATED",
+          "nodeId": newNode,
+          "prevNodeId": -1
+        }
+      ]
+    }, lambda x: x["type"] == "GAME_UPDATE" and x["channelId"] == channelId and findEvent(x["sgfEvents"], newNode))
+  # Перемещается по демонстрационной партии
+  def demoJumpToMove(self, channelId, moveNum):
+    moveCur = moveNum
+    nodes = self.games[channelId]["nodes"]
+    curNode = nodes[0]
+    while moveCur > 0:
+      moveCur -= 1
+      newCur = None
+      lastPos = 0
+      for node in nodes:
+        if nodes[node]["parentNode"] == curNode["nodeId"] and nodes[node]["position"] == lastPos:
+          newCur = nodes[node]
+          lastPos += 1
+      if not newCur:
+        break
+      else:
+        curNode = newCur
+    newNode = curNode["nodeId"]
+    if newNode == self.games[channelId]["activeNode"]:
+      return()
+    def findEvent(events, nodeId):
+      for event in events:
+        if event["type"] == "ACTIVATED" and event["nodeId"] == nodeId:
+          return True
+      return False
+    self.sendRequestAndWaitAnswer({
+      "type": "KGS_SGF_CHANGE",
+      "channelId": channelId,
+      "sgfEvents": [
+        {
+          "type": "ACTIVATED",
+          "nodeId": newNode,
+          "prevNodeId": -1
+        }
+      ]
+    }, lambda x: x["type"] == "GAME_UPDATE" and x["channelId"] == channelId and findEvent(x["sgfEvents"], newNode))
+  # Обновляет информацию о времени
+  def demoTimeLeft(self, channelId, colour, mainTime, byoyomiStones):
+    self.sendRequest({
+      "type": "KGS_SGF_CHANGE",
+      "channelId": channelId,
+      "sgfEvents": [
+        {
+          "type": "PROP_ADDED",
+          "nodeId": self.games[channelId]["activeNode"],
+          "prop":
+            {
+              "name": "TIMELEFT",
+              "color": colour,
+              "float": mainTime,
+              "int": byoyomiStones
+            }
+        }
+      ]
+    })
+  # Обновляет информацию о результате
+  def demoSetResult(self, channelId, result):
+    self.sendRequest({
+      "type": "KGS_SGF_CHANGE",
+      "channelId": channelId,
+      "sgfEvents": [
+        {
+          "type": "PROP_ADDED",
+          "nodeId": 0,
+          "prop": {
+            "name": "RESULT",
+            "text": result
+          }
+        }
+      ]
+    })
+  # Сохраняет игру на сервере
+  def saveGame(self, channelId):
+    self.sendRequest({
+      "type": "GAME_LIST_ENTRY_SET_FLAGS",
+      "channelId": channelId,
+      "saved": True
+    })
+  # Начало ожидания сообщения
+  def startWaitMsg(self):
+    self.logLock.acquire()
+    try:
+      self.logMessages += 1
+    finally:
+      self.logLock.release()
+  # Отмена ожидания сообщения
+  def cancelWaitMsg(self):
+    self.logLock.acquire()
+    try:
+      self.logMessages -= 1
+      if self.logMessages == 0:
+        self.logMessages = []
+    finally:
+      self.logLock.release()
+  # Конец ожидания сообщения
+  def endWaitMsg(self, msgFilter):
+    if self.terminated:
+      return None
+    retMsg = None
+    self.queueLock.acquire()
+    try:
+      self.msgQueueFilter.append(msgFilter)
+      self.queueFeed.clear()
+    finally:
+      self.queueLock.release()
+    self.logLock.acquire()
+    try:
+      self.logMessages -= 1
+      for msg in self.msgLog:
+        if msgFilter(msg):
+          retMsg = msg
+          break
+      if self.logMessages == 0:
+        self.msgLog = []
+    finally:
+      self.logLock.release()
+    if retMsg is not None:
+      self.queueLock.acquire()
+      try:
+        if msgFilter in self.msgQueueFilter:
+          self.msgQueueFilter.remove(msgFilter)
+      finally:
+        self.queueLock.release()
+      return retMsg
+    if not self.proc:
+      self.proc = threadStart(self.processResponse)
+    retMsg = timeout(lambda: self.waitForQueueMsg(msgFilter), 20, None)
+    if retMsg is None:
+      self.queueLock.acquire()
+      try:
+        if msgFilter in self.msgQueueFilter:
+          self.msgQueueFilter.remove(msgFilter)
+          self.queueFeed.set()
+      finally:
+        self.queueLock.release()
+    return retMsg
 
 # Класс для управления временем игрока
 class Timer(object):
@@ -256,8 +679,8 @@ class Referee(object):
 
 # Класс игры
 class Game(object):
-  # Принимает командную строку судью, команды для его настройки, логин и пароль KGS, имена ботов, основное время, байоми и число ходов за байоми
-  def __init__(self, referee, setupCommands, kgsNick, kgsPwd, kgsTitle, names, mainTime, byoyomiTime, byoyomiMoves):
+  # Принимает командную строку судью, команды для его настройки, API-адрес, комнату, логин и пароль KGS, заголовок игры, имена ботов, основное время, байоми и число ходов за байоми
+  def __init__(self, referee, setupCommands, kgsApi, kgsRoom, kgsNick, kgsPwd, kgsTitle, names, mainTime, byoyomiTime, byoyomiMoves):
     from threading import Lock, Event
     from random import randint
     self.name = kgsTitle
@@ -271,12 +694,27 @@ class Game(object):
     self.result = ""
     self.cleanupMode = False
     self.referee = Referee(referee, setupCommands)
+    self.kgsClient = KgsClient(kgsApi, kgsNick, kgsPwd)
+    timeMode = "absolute"
+    if byoyomiMoves > 0:
+      timeMode = "canadian"
+    self.kgsGame = self.kgsClient.createDemo(self.kgsClient.channelIdByRoomName(kgsRoom), 19, 7.5, timeMode, mainTime, byoyomiTime, byoyomiMoves)
     colour = randint(0,1)
+    playerWhite = ""
+    playerBlack = ""
     for x in names:
       print("%s: %s - %s" % (self.name, x, self.colours[colour]))
+      if colour == 0:
+        playerBlack = x[:10]
+      else:
+        playerWhite = x[:10]
       self.playerColours[x] = self.colours[colour]
       self.timers.append(Timer(mainTime, byoyomiTime, byoyomiMoves))
       colour ^= 1
+    self.kgsClient.demoSetInfo(self.kgsGame, playerWhite, playerBlack, "vpgtpd server", self.name)
+    for x in names:
+      self.kgsClient.sendMessage(self.kgsGame, "Player: %s - %s" % (x, self.playerColours[x]))
+    self.kgsClient.sendMessage(self.kgsGame, "Referee: %s" % self.referee.name)
   # Пытается сделать ход, судья его проверяет и записывает
   def attemptMove(self, move):
     r = self.referee.sendCommand("play %s %s" % (self.colours[self.colour], move))
@@ -286,7 +724,7 @@ class Game(object):
         if x != self.colours[self.colour]:
           self.players[x].sendCommandWithTimeout("play %s %s" % (self.colours[self.colour], move))
       return True
-    else:  
+    else:
       return False
   # Ждет хода от игрока
   def waitMove(self):
@@ -338,22 +776,31 @@ class Game(object):
             move = timeout(self.waitMove, time)
           time = self.timers[self.colour].sameMove()
         time, periods = self.timers[self.colour].endMove()
+        self.kgsClient.demoTimeLeft(self.colours[self.colour], time, periods)
         for x in self.players:
           self.players[x].sendCommandWithTimeout("time_left %s %d %d" % (self.colours[self.colour], time, periods))
         if move == "resign":
-          self.result = "%s+R" % self.colours[self.colour ^ 1][0]
+          self.result = "%s+R" % self.colours[self.colour ^ 1][0].upper()
+          self.kgsClient.demoSetResult(self.kgsGame, "%s+RESIGN" % self.colours[self.colour ^ 1][0].upper())
           break
         elif self.timers[self.colour].lostOnTime():
-          self.result = "%s+T" % self.colours[self.colour ^ 1][0]
+          self.result = "%s+T" % self.colours[self.colour ^ 1][0].upper()
+          self.kgsClient.demoSetResult(self.kgsGame, "%s+TIME" % self.colours[self.colour ^ 1][0].upper())
           break
         elif not self.attemptMove(move):
-          self.result = "%s+" % self.colours[self.colour ^ 1][0]
+          self.kgsClient.sendMessage(self.kgsGame, "Attempted move: %s %s" % (self.colours[self.colour], move))
+          self.result = "%s+" % self.colours[self.colour ^ 1][0].upper()
+          self.kgsClient.demoSetResult(self.kgsGame, "%s+FORFEIT" % self.colours[self.colour ^ 1][0].upper())
           break
         elif self.referee.gameEnded() and self.finishGame():
           break
+        self.kgsClient.demoPlayMove(self.kgsGame, self.colours[self.colour], move)
         print("%s: move %s %s" % (self.name, self.colours[self.colour], move))
         self.colour ^= 1
       print("%s: result %s" % (self.name, self.result))
+      self.kgsClient.sendMessage(self.kgsGame, "Game result: %s" % self.result)
+      self.kgsClient.saveGame(self.kgsGame)
+      self.kgsClient.terminate()
       self.removeDeadPlayers()
       for x in self.players:
         self.players[x].session.close()
@@ -369,14 +816,16 @@ class Game(object):
         deadStones.append(set(stone.lower() for stone in " ".join(self.players[x].sendCommandWithTimeout("final_status_list dead"))[2:].split()))
       if deadStones[0] != deadStones[1]:
         self.cleanupMode = True
+        self.kgsClient.sendMessage(self.kgsGame, "Players do not agree on dead stones status")
         return False
     results = []
     self.removeDeadPlayers()
     for x in self.players:
-      results.append(self.players[x].sendCommandWithTimeout("final_score")[0][2:].lower())
-    results.append(self.referee.sendCommand("final_score")[0][2:].lower())
+      results.append(self.players[x].sendCommandWithTimeout("final_score")[0][2:].upper())
+    results.append(self.referee.sendCommand("final_score")[0][2:].upper())
     if results[1:] == results[:-1]:
       self.result = results[0]
+      self.kgsClient.demoSetResult(self.kgsGame, self.result)
     elif results[1:-1] == results[:-2]:
       self.result = "players: %s, referee: %s" % (results[0], results[-1])
     else:
@@ -386,7 +835,7 @@ class Game(object):
 # Класс для управления сервером
 class Server(object):
   # Принимает адрес, порт, командную строку судьи, команды настройки судьи, команды настройки игроков, ники и пароли KGS, участников и настройки времени
-  def __init__(self, host, port, referee, refereeSetup, playerSetup, kgsNames, kgsPwds, kgsTitles, participants, mainTime, byoyomiTime, byoyomiMoves):
+  def __init__(self, host, port, referee, refereeSetup, playerSetup, kgsApi, kgsRooms, kgsNames, kgsPwds, kgsTitles, participants, mainTime, byoyomiTime, byoyomiMoves):
     self.host = host
     self.port = port
     self.playerSetup = playerSetup
@@ -396,7 +845,7 @@ class Server(object):
     self.sock = None
     self.threads = []
     for i in range(0, numGames):
-      self.games.append(Game(referee, refereeSetup, kgsNames[i], kgsPwds[i], kgsTitles[i], participants[i], mainTime, byoyomiTime, byoyomiMoves))
+      self.games.append(Game(referee, refereeSetup, kgsApi, kgsRooms[i], kgsNames[i], kgsPwds[i], kgsTitles[i], participants[i], mainTime, byoyomiTime, byoyomiMoves))
   # Настраивает игрока
   def setupParticipant(self, socket):
     try:
@@ -421,6 +870,7 @@ class Server(object):
       self.games[game].removeDeadPlayers()
       if colour not in self.games[game].players:
         print("Player joined: %s as %s in %s" % (player.name, colour, self.games[game].name))
+        self.games[game].kgsClient.sendMessage(self.games[game].kgsGame, "Player joined: %s" % (player.name))
         self.games[game].players[colour] = player
         for x in self.playerSetup:
            self.games[game].players[colour].sendCommandWithTimeout(x)
@@ -471,9 +921,11 @@ if __name__ == '__main__':
   host = config["Server"]["Host"]
   port = int(config["Server"]["Port"])
   referee = config["Server"]["RefereeCmd"]
+  kgsApi = config["Server"]["KgsApi"]
   refereeSetup = list(config["RefereeSetupCommands"].values())
   playerSetup = list(config["PlayerSetupCommands"].values())
   gameIds = []
+  kgsRooms = []
   kgsNames = []
   kgsPwds = []
   participants = []
@@ -486,20 +938,23 @@ if __name__ == '__main__':
     v = x.split("=")
     if v[0] != "Game" or len(v) != 2:
       continue
+    kgsRoom = config[x]["KGSRoom"]
     kgsName = config[x]["KGSName"]
     kgsPwd = config[x]["KGSPassword"]
     botNames = [config[x]["Player1"], config[x]["Player2"]]
     if v[1] in gameIds:
       ind = gameIds.index(v[1])
+      kgsRooms[ind] = kgsRoom
       kgsNames[ind] = kgsName
       kgsPwds[ind] = kgsPwd
       participants[ind] = botNames
     else:
       gameIds.append(v[1])
+      kgsRooms.append(kgsRoom)
       kgsNames.append(kgsName)
       kgsPwds.append(kgsPwd)
       participants.append(botNames)
-  server = Server(host, port, referee, refereeSetup, playerSetup, kgsNames, kgsPwds, gameIds, participants, mainTime, byoyomiTime, byoyomiMoves)
+  server = Server(host, port, referee, refereeSetup, playerSetup, kgsApi, kgsRooms, kgsNames, kgsPwds, gameIds, participants, mainTime, byoyomiTime, byoyomiMoves)
   threadStart(server.startServer)
   diff = (roundStart - datetime.now()).total_seconds()
   if diff > 0:
