@@ -31,6 +31,7 @@ def sockToApp(sock, proc):
     sock.close()
     print("Lost connection")
     try:
+      print("quit")
       proc.stdin.write("quit\n".encode('utf-8'))
       proc.stdin.flush()
     except:
@@ -54,13 +55,13 @@ def appToSock(sock, proc):
     pass
     
 # Поделючается к серверу
-def clientStart(host, port, cmdLine, setup):
+def clientStart(host, port, cmdLine, id, setup):
   import shlex
   from subprocess import Popen, PIPE
   
   proc = Popen(shlex.split(cmdLine), stdin = PIPE, stdout = PIPE)
   for x in setup:
-    proc.stdin.write(("%s\n" % x).encode('utf-8'))
+    proc.stdin.write(("%s\n" % x).encode("utf-8"))
     proc.stdin.flush()
     while True:
       line = proc.stdout.readline().decode('utf-8')[:-1]
@@ -70,6 +71,7 @@ def clientStart(host, port, cmdLine, setup):
         break
   sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
   sock.connect((host, port))
+  sock.send(("%s\n" % id).encode('utf-8'))
   t1 = threadStart(lambda: sockToApp(sock, proc))
   t2 = threadStart(lambda: appToSock(sock, proc))
   t1.join()
@@ -83,5 +85,6 @@ if __name__ == '__main__':
   host = config["Client"]["Host"]
   port = int(config["Client"]["Port"])
   cmd = config["Client"]["Cmd"]
+  id = config["Client"]["ID"]
   playerSetup = list(config["Commands"].values())
-  clientStart(host, port, cmd, playerSetup)
+  clientStart(host, port, cmd, id, playerSetup)

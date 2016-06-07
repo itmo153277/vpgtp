@@ -538,6 +538,7 @@ class Player(object):
     self.feedEvent = Event()
     self.bufLock = Lock()
     threadStart(self.process)
+    self.id = self.readLine()
     reqCommands = ["known_command", "name", "quit", "boardsize", "komi", "clear_board", "final_score", "final_status_list", "play", "genmove"]
     for x in reqCommands:
       if self.sendCommandWithTimeout("known_command %s" % x)[0].lower() != "= true":
@@ -682,7 +683,7 @@ class Referee(object):
 # Класс игры
 class Game(object):
   # Принимает командную строку судью, команды для его настройки, API-адрес, комнату, логин и пароль KGS, заголовок игры, имена ботов, основное время, байоми и число ходов за байоми
-  def __init__(self, referee, setupCommands, kgsApi, kgsRoom, kgsNick, kgsPwd, kgsTitle, names, mainTime, byoyomiTime, byoyomiMoves):
+  def __init__(self, referee, setupCommands, kgsApi, kgsRoom, kgsNick, kgsPwd, kgsTitle, names, ids, mainTime, byoyomiTime, byoyomiMoves):
     from threading import Lock, Event
     from random import randint
     self.name = kgsTitle
@@ -704,18 +705,19 @@ class Game(object):
     colour = randint(0,1)
     playerWhite = ""
     playerBlack = ""
-    for x in names:
-      print("%s: %s - %s" % (self.name, x, self.colours[colour]))
+    for x in range(0, len(ids)):
+      print("%s: %s - %s" % (self.name, names[x], self.colours[colour]))
+      playerName = names[x]
       if colour == 0:
-        playerBlack = x[:10]
+        playerBlack = playerName[:10]
       else:
-        playerWhite = x[:10]
-      self.playerColours[x] = self.colours[colour]
+        playerWhite = playerName[:10]
+      self.playerColours[ids[x]] = self.colours[colour]
       self.timers.append(Timer(mainTime, byoyomiTime, byoyomiMoves))
       colour ^= 1
     self.kgsClient.demoSetInfo(self.kgsGame, playerWhite, playerBlack, "vpgtpd server", self.name)
-    for x in names:
-      self.kgsClient.sendMessage(self.kgsGame, "Player: %s - %s" % (x, self.playerColours[x]))
+    for x in range(0, len(ids)):
+      self.kgsClient.sendMessage(self.kgsGame, "Player: %s - %s" % (names[x], self.playerColours[ids[x]]))
     self.kgsClient.sendMessage(self.kgsGame, "Referee: %s" % self.referee.name)
   # Пытается сделать ход, судья его проверяет и записывает
   def attemptMove(self, move):
@@ -778,25 +780,29 @@ class Game(object):
             move = timeout(self.waitMove, time)
           time = self.timers[self.colour].sameMove()
         time, periods = self.timers[self.colour].endMove()
-        self.kgsClient.demoTimeLeft(self.colours[self.colour], time, periods)
         for x in self.players:
           self.players[x].sendCommandWithTimeout("time_left %s %d %d" % (self.colours[self.colour], time, periods))
         if move == "resign":
-          self.result = "%s+R" % self.colours[self.colour ^ 1][0].upper()
+          self.result = "%s+Resign" % self.colours[self.colour ^ 1][0].upper()
+          self.kgsClient.demoTimeLeft(self.kgsGame, self.colours[self.colour], time, periods)
           self.kgsClient.demoSetResult(self.kgsGame, "%s+RESIGN" % self.colours[self.colour ^ 1][0].upper())
           break
         elif self.timers[self.colour].lostOnTime():
-          self.result = "%s+T" % self.colours[self.colour ^ 1][0].upper()
+          self.result = "%s+Time" % self.colours[self.colour ^ 1][0].upper()
+          self.kgsClient.demoTimeLeft(self.kgsGame, self.colours[self.colour], time, periods)
           self.kgsClient.demoSetResult(self.kgsGame, "%s+TIME" % self.colours[self.colour ^ 1][0].upper())
           break
         elif not self.attemptMove(move):
           self.kgsClient.sendMessage(self.kgsGame, "Attempted move: %s %s" % (self.colours[self.colour], move))
-          self.result = "%s+" % self.colours[self.colour ^ 1][0].upper()
+          self.result = "%s+Forfeit" % self.colours[self.colour ^ 1][0].upper()
+          self.kgsClient.demoTimeLeft(self.kgsGame, self.colours[self.colour], time, periods)
           self.kgsClient.demoSetResult(self.kgsGame, "%s+FORFEIT" % self.colours[self.colour ^ 1][0].upper())
           break
-        elif self.referee.gameEnded() and self.finishGame():
-          break
-        self.kgsClient.demoPlayMove(self.kgsGame, self.colours[self.colour], move)
+        else:
+          self.kgsClient.demoPlayMove(self.kgsGame, self.colours[self.colour], move)
+          self.kgsClient.demoTimeLeft(self.kgsGame, self.colours[self.colour], time, periods)
+          if self.referee.gameEnded() and self.finishGame():
+            break
         print("%s: move %s %s" % (self.name, self.colours[self.colour], move))
         self.colour ^= 1
       print("%s: result %s" % (self.name, self.result))
@@ -837,17 +843,18 @@ class Game(object):
 # Класс для управления сервером
 class Server(object):
   # Принимает адрес, порт, командную строку судьи, команды настройки судьи, команды настройки игроков, ники и пароли KGS, участников и настройки времени
-  def __init__(self, host, port, referee, refereeSetup, playerSetup, kgsApi, kgsRooms, kgsNames, kgsPwds, kgsTitles, participants, mainTime, byoyomiTime, byoyomiMoves):
+  def __init__(self, host, port, referee, refereeSetup, playerSetup, kgsApi, kgsRooms, kgsNames, kgsPwds, kgsTitles, participants, participantIds, mainTime, byoyomiTime, byoyomiMoves):
     self.host = host
     self.port = port
     self.playerSetup = playerSetup
     self.participants = participants
+    self.participantIds = participantIds
     numGames = len(participants)
     self.games = []
     self.sock = None
     self.threads = []
     for i in range(0, numGames):
-      self.games.append(Game(referee, refereeSetup, kgsApi, kgsRooms[i], kgsNames[i], kgsPwds[i], kgsTitles[i], participants[i], mainTime, byoyomiTime, byoyomiMoves))
+      self.games.append(Game(referee, refereeSetup, kgsApi, kgsRooms[i], kgsNames[i], kgsPwds[i], kgsTitles[i], participants[i], participantIds[i], mainTime, byoyomiTime, byoyomiMoves))
   # Настраивает игрока
   def setupParticipant(self, socket):
     try:
@@ -856,9 +863,9 @@ class Server(object):
       socket.close()
       return
     game = None
-    for i in range(0, len(self.participants)):
-      for x in self.participants[i]:
-        if x == player.name:
+    for i in range(0, len(self.participantIds)):
+      for x in self.participantIds[i]:
+        if x == player.id:
           game = i
           break
       if game is not None:
@@ -866,13 +873,13 @@ class Server(object):
     if game is None or self.games[game].result:
       socket.close()
       return
-    colour = self.games[game].playerColours[player.name]
+    colour = self.games[game].playerColours[player.id]
     self.games[game].playerBusy.acquire()
     try:
       self.games[game].removeDeadPlayers()
       if colour not in self.games[game].players:
         print("Player joined: %s as %s in %s" % (player.name, colour, self.games[game].name))
-        self.games[game].kgsClient.sendMessage(self.games[game].kgsGame, "Player joined: %s" % (player.name))
+        self.games[game].kgsClient.sendMessage(self.games[game].kgsGame, "Joined: %s" % (player.name))
         self.games[game].players[colour] = player
         for x in self.playerSetup:
            self.games[game].players[colour].sendCommandWithTimeout(x)
@@ -931,6 +938,7 @@ if __name__ == '__main__':
   kgsNames = []
   kgsPwds = []
   participants = []
+  participantIds = []
   mainTime = int(config["Server"]["MainTime"])
   byoyomiTime = int(config["Server"]["ByoyomiTime"])
   byoyomiMoves = int(config["Server"]["ByoyomiMoves"])
@@ -944,19 +952,22 @@ if __name__ == '__main__':
     kgsName = config[x]["KGSName"]
     kgsPwd = config[x]["KGSPassword"]
     botNames = [config[x]["Player1"], config[x]["Player2"]]
+    botIds = [config[x]["Player1ID"], config[x]["Player2ID"]]
     if v[1] in gameIds:
       ind = gameIds.index(v[1])
       kgsRooms[ind] = kgsRoom
       kgsNames[ind] = kgsName
       kgsPwds[ind] = kgsPwd
       participants[ind] = botNames
+      participantIds[ind] = botIds
     else:
       gameIds.append(v[1])
       kgsRooms.append(kgsRoom)
       kgsNames.append(kgsName)
       kgsPwds.append(kgsPwd)
       participants.append(botNames)
-  server = Server(host, port, referee, refereeSetup, playerSetup, kgsApi, kgsRooms, kgsNames, kgsPwds, gameIds, participants, mainTime, byoyomiTime, byoyomiMoves)
+      participantIds.append(botIds)
+  server = Server(host, port, referee, refereeSetup, playerSetup, kgsApi, kgsRooms, kgsNames, kgsPwds, gameIds, participants, participantIds, mainTime, byoyomiTime, byoyomiMoves)
   threadStart(server.startServer)
   diff = (roundStart - datetime.now()).total_seconds()
   if diff > 0:
